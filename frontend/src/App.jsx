@@ -74,32 +74,46 @@ print("Hello " + username)`);
     setHistory([]);
   };
 
-  const runAgent = async () => {
-    const token = localStorage.getItem("token");
+ const runAgent = async () => {
+  const token = localStorage.getItem("token");
 
-    if (!code.trim()) {
-      showNotice("Paste Python code first");
+  if (!token) {
+    showNotice("Session expired. Please login again.");
+    setLoggedIn(false);
+    return;
+  }
+
+  if (!code.trim()) {
+    showNotice("Paste Python code first");
+    return;
+  }
+
+  setLoading(true);
+  setResult(null);
+
+  try {
+    const res = await fetch(`${API}/debug?token=${token}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      showNotice(data.detail || "Backend error");
+      setLoading(false);
       return;
     }
 
-    setLoading(true);
-    setResult(null);
+    setResult(data);
 
-    try {
-      const res = await fetch(`${API}/debug?token=${token}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
-      });
+  } catch (err) {
+    showNotice("Backend failed. Try again after 30 seconds.");
+  }
 
-      const data = await res.json();
-      setResult(data);
-    } catch {
-      showNotice("Backend may be sleeping. Try again in 30 seconds.");
-    }
-
-    setLoading(false);
-  };
+  setLoading(false);
+};
 
   const loadHistory = async () => {
     const token = localStorage.getItem("token");
