@@ -40,11 +40,7 @@ app = FastAPI(title="DevRescue AI Backend - MongoDB")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://dev-rescue-agent.vercel.app",
-        "https://dev-rescue-agent-ey2y5f2c0-amssre16256-stacks-projects.vercel.app",
-        "http://localhost:5173",
-    ],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
