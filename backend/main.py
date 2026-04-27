@@ -37,6 +37,18 @@ users_collection = db["users"]
 history_collection = db["history"]
 
 app = FastAPI(title="DevRescue AI Backend - MongoDB")
+@app.middleware("http")
+async def add_cors_headers(request, call_next):
+    if request.method == "OPTIONS":
+        from fastapi.responses import Response
+        response = Response()
+    else:
+        response = await call_next(request)
+
+    response.headers["Access-Control-Allow-Origin"] = "https://dev-rescue-agent.vercel.app"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 app.add_middleware(
     CORSMiddleware,
