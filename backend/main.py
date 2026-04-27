@@ -4,24 +4,39 @@ from pydantic import BaseModel
 from jose import jwt, JWTError
 from openai import OpenAI
 from dotenv import load_dotenv
-import sqlite3
+from pymongo import MongoClient
 import hashlib
 import subprocess
 import tempfile
 import os
 from datetime import datetime, timedelta
+from bson import ObjectId
 
 load_dotenv()
 
 SECRET_KEY = "devrescue_secret_key"
 ALGORITHM = "HS256"
 
-client = OpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MONGO_URL = os.getenv("MONGO_URL")
+
+if not GROQ_API_KEY:
+    raise Exception("GROQ_API_KEY missing")
+
+if not MONGO_URL:
+    raise Exception("MONGO_URL missing")
+
+ai_client = OpenAI(
+    api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1"
 )
 
-app = FastAPI(title="DevRescue AI Backend - Agentic Debugger")
+mongo_client = MongoClient(MONGO_URL)
+db = mongo_client["devrescue"]
+users_collection = db["users"]
+history_collection = db["history"]
+
+app = FastAPI(title="DevRescue AI Backend - MongoDB")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,38 +52,6 @@ class AuthRequest(BaseModel):
 
 class CodeRequest(BaseModel):
     code: str
-
-def get_db():
-    conn = sqlite3.connect("devrescue.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    db = get_db()
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL
-    )
-    """)
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        code TEXT,
-        error TEXT,
-        fixed_code TEXT,
-        output TEXT,
-        agent_type TEXT,
-        attempts INTEGER,
-        created_at TEXT
-    )
-    """)
-    db.commit()
-    db.close()
-
-init_db()
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -89,7 +72,7 @@ def verify_token(token):
 
 @app.get("/")
 def home():
-    return {"message": "DevRescue Agentic Backend running"}
+    return {"message": "DevRescue MongoDB Backend running"}
 
 @app.post("/signup")
 def signup(user: AuthRequest):
@@ -99,18 +82,18 @@ def signup(user: AuthRequest):
     if not username or not password:
         raise HTTPException(status_code=400, detail="Username and password required")
 
-    db = get_db()
-    try:
-        db.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-            (username, hash_password(password))
-        )
-        db.commit()
-        return {"message": "User created successfully"}
-    except sqlite3.IntegrityError:
+    existing_user = users_collection.find_one({"username": username})
+
+    if existing_user:
         raise HTTPException(status_code=400, detail="User already exists")
-    finally:
-        db.close()
+
+    users_collection.insert_one({
+        "username": username,
+        "password_hash": hash_password(password),
+        "created_at": datetime.utcnow()
+    })
+
+    return {"message": "User created successfully"}
 
 @app.post("/login")
 def login(user: AuthRequest):
@@ -120,14 +103,12 @@ def login(user: AuthRequest):
     if not username or not password:
         raise HTTPException(status_code=400, detail="Username and password required")
 
-    db = get_db()
-    saved_user = db.execute(
-        "SELECT * FROM users WHERE username = ?",
-        (username,)
-    ).fetchone()
-    db.close()
+    saved_user = users_collection.find_one({"username": username})
 
-    if not saved_user or saved_user["password_hash"] != hash_password(password):
+    if not saved_user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    if saved_user["password_hash"] != hash_password(password):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     return {
@@ -137,6 +118,12 @@ def login(user: AuthRequest):
 
 def run_code(code):
     try:
+        blocked_words = ["os.system", "subprocess", "shutil.rmtree", "rm -rf", "open("]
+
+        for word in blocked_words:
+            if word in code:
+                return "", "Restricted operation detected for safety."
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".py", mode="w", encoding="utf-8") as f:
             f.write(code)
             file_name = f.name
@@ -172,22 +159,20 @@ def extract_code(text):
 
     return text
 
-def groq_fix_code(code, error, attempt):
+def ai_fix_code(code, error, attempt):
     prompt = f"""
 You are DevRescue AI, an autonomous Python debugging agent.
 
-You are on repair attempt number {attempt}.
+Repair attempt: {attempt}
 
-Your task:
-Fix the broken Python code.
+Fix this broken Python code.
 
 Rules:
 - Return ONLY corrected Python code.
 - No explanation.
 - No markdown.
-- Preserve the user's original intent.
-- Do not add unsafe file deletion, networking, credential access, shell commands, or system commands.
-- If the previous fix still failed, produce a better corrected version.
+- Preserve user's intent.
+- Do not add unsafe system commands, networking, file deletion, credential access, or shell commands.
 
 Broken code:
 {code}
@@ -196,12 +181,12 @@ Observed error:
 {error}
 """
 
-    response = client.chat.completions.create(
+    response = ai_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[
             {
                 "role": "system",
-                "content": "You are a precise Python debugging agent. Return only valid corrected Python code."
+                "content": "You are a precise Python debugging agent. Return only corrected Python code."
             },
             {
                 "role": "user",
@@ -216,102 +201,80 @@ Observed error:
 def fallback_fix_code(code, error):
     fixed = code
 
-    if "IndexError" in error and "range(5)" in code:
-        fixed = fixed.replace("range(5)", "range(len(numbers))")
-
-    elif "ZeroDivisionError" in error:
-        fixed = fixed.replace("print(a / b)", "print('Cannot divide by zero' if b == 0 else a / b)")
-
-    elif "NameError" in error and "username" in error:
+    if "NameError" in error and "username" in error:
         fixed = fixed.replace("username", "name")
+
+    elif "IndexError" in error and "range(5)" in code:
+        fixed = fixed.replace("range(5)", "range(len(numbers))")
 
     elif "SyntaxError" in error:
         fixed = fixed.replace("prin(", "print(")
+
+    elif "ZeroDivisionError" in error:
+        fixed = fixed.replace("print(a / b)", "print('Cannot divide by zero' if b == 0 else a / b)")
 
     return fixed
 
 def agentic_debug_loop(original_code):
     steps = []
     current_code = original_code
-    final_output = ""
-    final_error = ""
     agent_type = "Groq Free AI Agent"
     attempts_used = 0
 
     for attempt in range(1, 4):
         attempts_used = attempt
-        steps.append(f"Attempt {attempt}: Executing code safely in backend sandbox.")
+        steps.append(f"Attempt {attempt}: Executing code safely.")
 
         output, error = run_code(current_code)
 
         if not error:
             steps.append(f"Attempt {attempt}: Code executed successfully. Validation passed.")
-            final_output = output
-            final_error = ""
-            return current_code, final_output, final_error, agent_type, attempts_used, steps
+            return current_code, output, "", agent_type, attempts_used, steps
 
-        steps.append(f"Attempt {attempt}: Error observed and captured.")
+        steps.append(f"Attempt {attempt}: Error detected.")
         steps.append(error.splitlines()[-1] if error.splitlines() else error)
 
         try:
-            steps.append(f"Attempt {attempt}: Sending error context to Groq AI for repair.")
-            current_code = groq_fix_code(current_code, error, attempt)
-            steps.append(f"Attempt {attempt}: AI generated a corrected version.")
+            steps.append(f"Attempt {attempt}: Sending error context to AI.")
+            current_code = ai_fix_code(current_code, error, attempt)
+            steps.append(f"Attempt {attempt}: AI generated corrected code.")
         except Exception as e:
             agent_type = "Fallback Agent: " + str(e)
-            steps.append(f"Attempt {attempt}: Groq failed, fallback repair engine activated.")
+            steps.append(f"Attempt {attempt}: AI failed. Using fallback repair.")
             current_code = fallback_fix_code(current_code, error)
 
-        final_output = output
-        final_error = error
-
-    steps.append("Maximum repair attempts reached. Returning best available fix.")
     output, error = run_code(current_code)
-    final_output = output
-    final_error = error
+    steps.append("Maximum attempts reached. Returning best available result.")
 
-    return current_code, final_output, final_error, agent_type, attempts_used, steps
+    return current_code, output, error, agent_type, attempts_used, steps
 
 @app.post("/debug")
 def debug_code(request: CodeRequest, token: str):
     username = verify_token(token)
 
-    if request.code.strip() == "":
+    if not request.code.strip():
         raise HTTPException(status_code=400, detail="Code is required")
 
-    db = get_db()
-    user = db.execute(
-        "SELECT * FROM users WHERE username = ?",
-        (username,)
-    ).fetchone()
+    user = users_collection.find_one({"username": username})
 
     if not user:
-        db.close()
         raise HTTPException(status_code=401, detail="User not found")
 
     original_output, original_error = run_code(request.code)
 
     fixed_code, fixed_output, fixed_error, agent_type, attempts, steps = agentic_debug_loop(request.code)
 
-    try:
-        db.execute("""
-            INSERT INTO history (user_id, code, error, fixed_code, output, agent_type, attempts, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user["id"],
-            request.code,
-            original_error,
-            fixed_code,
-            fixed_output if fixed_output else fixed_error,
-            agent_type,
-            attempts,
-            datetime.now().isoformat()
-        ))
-        db.commit()
-    except Exception:
-        pass
-    finally:
-        db.close()
+    history_collection.insert_one({
+        "user_id": str(user["_id"]),
+        "username": username,
+        "code": request.code,
+        "error": original_error,
+        "fixed_code": fixed_code,
+        "output": fixed_output if fixed_output else fixed_error,
+        "agent_type": agent_type,
+        "attempts": attempts,
+        "created_at": datetime.utcnow()
+    })
 
     return {
         "original_error": original_error,
@@ -328,20 +291,27 @@ def debug_code(request: CodeRequest, token: str):
 def get_history(token: str):
     username = verify_token(token)
 
-    db = get_db()
-    user = db.execute(
-        "SELECT * FROM users WHERE username = ?",
-        (username,)
-    ).fetchone()
+    user = users_collection.find_one({"username": username})
 
     if not user:
-        db.close()
         raise HTTPException(status_code=401, detail="User not found")
 
-    rows = db.execute(
-        "SELECT * FROM history WHERE user_id = ? ORDER BY id DESC",
-        (user["id"],)
-    ).fetchall()
+    rows = history_collection.find(
+        {"user_id": str(user["_id"])}
+    ).sort("created_at", -1)
 
-    db.close()
-    return [dict(row) for row in rows]
+    history = []
+
+    for row in rows:
+        history.append({
+            "id": str(row["_id"]),
+            "code": row.get("code", ""),
+            "error": row.get("error", ""),
+            "fixed_code": row.get("fixed_code", ""),
+            "output": row.get("output", ""),
+            "agent_type": row.get("agent_type", ""),
+            "attempts": row.get("attempts", 1),
+            "created_at": str(row.get("created_at", ""))
+        })
+
+    return history
